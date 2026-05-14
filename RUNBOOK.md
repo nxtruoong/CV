@@ -2,10 +2,9 @@
 
 End-to-end execution guide. Pair with `PLAN.md` (experimental design) and `README.md` (overview).
 
-Estimated wall clock: **3-4 days**, ~15h Kaggle GPU budget.
+Estimated wall clock: **2-3 days**, ~12h Kaggle GPU budget.
 
-Pretrain finishes in ~8-9h on T4 x2 (200 epochs × 2.3 min/epoch + diagnostics).
-Target 1 session if you can babysit; 2 sessions if not.
+Pretrain target: < 10h single T4 x2 session (100 epochs × ~5 min/epoch + diagnostics). Resume path exists as fallback if session times out.
 
 ---
 
@@ -44,9 +43,11 @@ git push origin main
 ### 1.2 Clone repo
 Cell 1:
 ```python
-!git clone https://github.com/nxtruoong/CV.git /kaggle/working/CV
+!git clone https://github.com/nxtruoong/ComputerVisionSimCLR.git /kaggle/working/CV
 !pip install -q timm
 ```
+
+Note: clone target dir is `/kaggle/working/CV` — `kaggle_pretrain.py` hardcodes `REPO_ROOT = "/kaggle/working/CV"`. Keep the target name.
 
 ### 1.3 Run sanity check
 Cell 2:
@@ -81,23 +82,35 @@ All fold subject overlaps = 0. GroupKFold OK.
 | `FileNotFoundError driver_imgs_list.csv` | Dataset not attached or wrong path | Check `!ls /kaggle/input/competitions/`; update `src/config.py:KAGGLE_INPUT` if slug differs |
 | `Subject leakage in fold N` assert | Bug in GroupKFold | Stop, do not proceed |
 | `ModuleNotFoundError: timm` | Install cell skipped | Re-run cell 1 |
+| `ModuleNotFoundError: src` | `sys.path` not picked up by exec | Run `import sys, os; sys.path.insert(0, "/kaggle/working/CV"); os.chdir("/kaggle/working/CV")` in a cell **before** the exec |
 | Image count != 22424 | Partial dataset | Re-attach competition input |
 
 ---
 
-## Day 2 — SimCLR pretrain (1 session if possible, ~8-9h)
+## Day 2 — SimCLR pretrain (single session target, < 10h)
 
-**Goal:** train SimCLR end-to-end in single session. Fallback: 2 sessions.
+**Goal:** train SimCLR end-to-end in one Kaggle session. Fallback: resume next session.
+
+**Config (from `src/config.py`):**
+- 100 epochs, 10 warmup + 90 cosine
+- Global batch 768 (per-GPU 384, DDP world_size=2)
+- LR 1.732e-3 = 1e-3 × sqrt(768/256)
+- Rect 160×120 pretrain images
+- AdamW, weight decay 1e-4, NT-Xent τ=0.5
+- torch.compile `mode="max-autotune"` + FP16 AMP + channels_last
+- num_workers=8 per rank (default in `kaggle_pretrain.py`)
 
 **Timing math:**
-- 399 steps/epoch × ~350ms/step ≈ 2.3 min/epoch
-- 200 epochs × 2.3 min ≈ 7.7h training + ~20 min diagnostics
-- Kaggle interactive cap ~9h → tight but feasible
+- ~133 steps/epoch (102k images / batch 768)
+- Target ~3-5 min/epoch steady-state → 100 epochs ≈ 6-9h training + ~20 min diagnostics
+- Kaggle interactive cap ~9h → single session feasible
+- First epoch slower (1-3 min) due to one-time torch.compile autotune
 
-**Mid-run sanity:** after epoch 1 stabilizes, check tqdm `it/s`:
-- ≥ 3 it/s → on track for 1 session
-- < 2 it/s → data loader bottleneck. Stop, bump num_workers=8, restart
-- ETA = (399 / it_per_sec × 200) / 3600 hours
+**Mid-run sanity:** after epoch 1 stabilizes, check tqdm `s/it`:
+- ≤ 2.5 s/it → on track (~5 min/epoch)
+- 3-5 s/it → tight, may overrun cap; consider lowering `num_workers` to 4 to reduce CPU contention OR upload partial ckpt before timeout
+- \> 5 s/it → loader bottleneck. Common cause: too many workers contending for 4 vCPUs. Drop to `num_workers=4` and restart
+- ETA = (133 × s/it × 100) / 3600 hours
 
 ### 2.1 New notebook
 Same data input attached. Settings:
@@ -106,44 +119,48 @@ Same data input attached. Settings:
 
 ### 2.2 Clone + install
 ```python
-!git clone https://github.com/nxtruoong/CV.git /kaggle/working/CV
+!git clone https://github.com/nxtruoong/ComputerVisionSimCLR.git /kaggle/working/CV
 !pip install -q timm
 ```
 
 ### 2.3 Launch pretrain
 ```python
+import sys, os
+sys.path.insert(0, "/kaggle/working/CV")
+os.chdir("/kaggle/working/CV")
 exec(open("/kaggle/working/CV/notebooks/kaggle_pretrain.py").read())
 ```
 
-`RESUME = None` already set. DDP via `mp.spawn` auto-detects 2 GPUs.
+`RESUME = None` already set. DDP via `mp.spawn` auto-detects 2 GPUs. The `sys.path.insert` + `os.chdir` cell is required — exec'd script can fail to resolve `src` on Kaggle without it.
 
 ### 2.4 Monitor
-- tqdm shows per-epoch loss
+- tqdm shows per-step loss + sampled `pos`, `neg`, `std` diagnostics every 20 steps
 - Every 10 epochs: `align`, `uniform`, `probe_acc`, `probe_ll` printed
 - Checkpoint saved every 10 epochs to `/kaggle/working/simclr/`
 
 **Healthy trajectory:**
 | Epoch | Loss | probe_acc |
 |---|---|---|
-| 0 | ~6.5 | ~0.10 |
-| 10 | ~5.5 | ~0.20 |
-| 30 | ~4.5 | ~0.45 |
-| 80 | ~4.0 | ~0.65 |
+| 0 | ~7.5 | ~0.10 |
+| 10 | ~6.0 | ~0.25 |
+| 30 | ~4.8 | ~0.50 |
+| 60 | ~4.2 | ~0.65 |
+| 100 | ~4.0 | ~0.70+ |
 
 If `probe_acc` < 0.20 at epoch 30 → **STOP**. Aug or temperature broken. Debug.
 
-### 2.5 If session finishes (200 epochs done)
+### 2.5 If session finishes (100 epochs done)
 1. Verify final ckpt:
    ```python
    !ls -la /kaggle/working/simclr/
    ```
-   Expect `simclr_resnet18_ep199.pth` + `simclr_resnet18_latest.pth` + `history.json`.
-2. Download `simclr_resnet18_ep199.pth` + `history.json`
+   Expect `simclr_resnet18_ep099.pth` + `simclr_resnet18_latest.pth` + `history.json`.
+2. Download `simclr_resnet18_ep099.pth` + `history.json`
 3. Upload as Kaggle Dataset titled `simclr-pretrain-final`
 4. Skip Day 3, jump to Day 4 PM (finetune)
 
-### 2.6 If session times out before ep200 (fallback)
-1. Note epoch reached (e.g. ep~150)
+### 2.6 If session times out before ep100 (fallback)
+1. Note epoch reached (e.g. ep~70)
 2. Download `simclr_resnet18_latest.pth`
 3. Upload as Kaggle Dataset `simclr-ckpt-resume`
 4. Go to Day 3 (resume session)
@@ -160,24 +177,25 @@ If `probe_acc` < 0.20 at epoch 30 → **STOP**. Aug or temperature broken. Debug
 
 ### 3.2 Clone + set resume path
 ```python
-!git clone https://github.com/nxtruoong/CV.git /kaggle/working/CV
+!git clone https://github.com/nxtruoong/ComputerVisionSimCLR.git /kaggle/working/CV
 !pip install -q timm
 ```
 
-Edit `notebooks/kaggle_pretrain.py` line ~32 before exec, OR inline:
+Inline launch with resume:
 ```python
 import sys, os, argparse
 REPO = "/kaggle/working/CV"
 sys.path.insert(0, REPO)
 os.environ["PYTHONPATH"] = REPO + os.pathsep + os.environ.get("PYTHONPATH", "")
+os.chdir(REPO)
 
 import torch, torch.multiprocessing as mp
 from src.pretrain import run_pretrain, ddp_worker
 
 RESUME = "/kaggle/input/simclr-ckpt-resume/simclr_resnet18_latest.pth"
 args = argparse.Namespace(
-    epochs=200, batch_size=256, lr=1e-3, num_workers=4, amp=True,
-    save_every=10, diagnostic_every=10, resume=RESUME,
+    epochs=100, batch_size=768, lr=1.732e-3, num_workers=8, amp=True,
+    no_compile=False, save_every=10, diagnostic_every=10, resume=RESUME,
     output_dir="/kaggle/working/simclr",
 )
 world_size = torch.cuda.device_count()
@@ -194,7 +212,7 @@ Resumed from /kaggle/input/simclr-ckpt-resume/simclr_resnet18_latest.pth at epoc
 ```
 
 ### 3.4 End of session
-Download `simclr_resnet18_ep199.pth` + `history.json`. Upload as `simclr-pretrain-final`.
+Download `simclr_resnet18_ep099.pth` + `history.json`. Upload as `simclr-pretrain-final`.
 
 ---
 
@@ -202,20 +220,23 @@ Download `simclr_resnet18_ep199.pth` + `history.json`. Upload as `simclr-pretrai
 
 **Goal:** A_scratch vs B_simclr vs C_imagenet on fold 0. Pick winner by val log loss.
 
-### 4.3 New notebook
-- GPU T4 x2 (only 1 used, but parallel sessions allowed)
+### 4.1 New notebook
+- GPU T4 x2 (only 1 used per finetune; parallel sessions allowed)
 - Attach: competition data + `simclr-pretrain-final`
 
-### 4.4 Run finetune
+### 4.2 Run finetune
 ```python
-!git clone https://github.com/nxtruoong/CV.git /kaggle/working/CV
+!git clone https://github.com/nxtruoong/ComputerVisionSimCLR.git /kaggle/working/CV
 !pip install -q timm
+import sys, os
+sys.path.insert(0, "/kaggle/working/CV")
+os.chdir("/kaggle/working/CV")
 exec(open("/kaggle/working/CV/notebooks/kaggle_finetune.py").read())
 ```
 
 Trains 3 models sequentially. ~45 min each.
 
-### 4.5 Read headline output
+### 4.3 Read headline output
 ```
 =========== Headline ===========
   A_scratch:  val_log_loss = 0.XXXX
@@ -227,9 +248,9 @@ Winner: <condition>
 
 Record numbers in `PLAN.md` § 10 table.
 
-### 4.6 Hypothesis check
-- **H1 (SSL > scratch):** `B - A ≥ 0.05`?
-- **H2 (SSL ≈ ImageNet):** `B - C ≤ 0.10`?
+### 4.4 Hypothesis check
+- **H1 (SSL > scratch):** `A − B ≥ 0.05`?
+- **H2 (SSL ≈ ImageNet):** `B − C ≤ 0.10`?
 
 Save all 3 bundles (download from `/kaggle/working/finetune/`).
 
@@ -237,9 +258,9 @@ Save all 3 bundles (download from `/kaggle/working/finetune/`).
 
 ## Day 4 Late — 5-fold ensemble of winner (~4h)
 
-### 4.7 New notebook, same inputs
+### 4.5 New notebook, same inputs
 ```python
-!git clone https://github.com/nxtruoong/CV.git /kaggle/working/CV
+!git clone https://github.com/nxtruoong/ComputerVisionSimCLR.git /kaggle/working/CV
 !pip install -q timm
 ```
 
@@ -249,16 +270,19 @@ WINNER_CONDITION = "B_simclr"  # or whichever won
 ```
 
 ```python
+import sys, os
+sys.path.insert(0, "/kaggle/working/CV")
+os.chdir("/kaggle/working/CV")
 exec(open("/kaggle/working/CV/notebooks/kaggle_finetune_kfold.py").read())
 ```
 
 Trains 5 folds (~45 min each) then runs TTA + ensemble inference on test set.
 
-### 4.8 Output
+### 4.6 Output
 - `/kaggle/working/submission_<WINNER>_5fold.csv` — submit to Kaggle
 - 5 bundles `demo_bundle_<WINNER>_fold[0-4].pth`
 
-### 4.9 Submit
+### 4.7 Submit
 Notebook → **Submit to Competition** → select CSV → wait for public LB score.
 
 Target: public LB log loss < 0.5 (typical SSL/ImageNet ResNet-18 range).
@@ -308,16 +332,21 @@ Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for
 - **Internet defaults Off** for competition notebooks. Enable in Settings.
 - **`/kaggle/working` wiped between sessions.** Always download ckpts you want to keep.
 - **Competition data mounts at `/kaggle/input/competitions/<slug>/`** on newer Kaggle. Older docs say `/kaggle/input/<slug>/`. Verify with `!ls /kaggle/input/`.
+- **Clone target dir must be `/kaggle/working/CV`** — `kaggle_pretrain.py` hardcodes that path as `REPO_ROOT`.
+- **`exec(open(...).read())` may fail to resolve `src`** — prepend a cell with `sys.path.insert(0, "/kaggle/working/CV"); os.chdir("/kaggle/working/CV")`.
 
 ### Training
-- **DDP world_size=2 → per-GPU batch 128.** Effective batch still 256 because NT-Xent gathers across ranks.
+- **DDP world_size=2 → per-GPU batch 384.** Global batch 768 because NT-Xent gathers features across ranks.
+- **num_workers=8 per rank** is the notebook default (16 total). Kaggle has 4 vCPU — that oversubscribes. If you see > 5 s/it consistently, drop to 4/rank or 2/rank.
 - **Do NOT use gradient accumulation** to fake larger batch — breaks NT-Xent in-batch negatives.
 - **No horizontal flip** in aug — would mix "phone right" with "phone left" classes.
 - **GroupKFold by subject** is non-negotiable. Random split = driver leakage = inflated val acc.
+- **`drop_last=True`** required for compile + DDP — variable-shape batches re-trigger autotune and corrupt CUDA graphs.
 
 ### Reproducibility
 - Seed = 24521897 everywhere (`src/seed_utils.py`)
 - DDP uses same seed across ranks but `DistributedSampler` shards by rank
+- `cudnn.deterministic=False` + `cudnn.benchmark=True` during pretrain (throughput > exact reproducibility); fine-tune still seeded for fold consistency
 - If results differ between runs, check: aug RNG, DataLoader `worker_init_fn`, AMP nondeterminism (small)
 
 ---
@@ -331,16 +360,19 @@ Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for
 | Finetune entry | `src/finetune.py` | 2-stage (freeze → discriminative LR) |
 | Submission | `src/submit.py` | TTA 5-crop, no flip, clip [1e-15, 1-1e-15] |
 | Augmentation | `src/augmentation.py` | NO horizontal flip |
-| Group splits | `src/data.py` | `build_group_kfold(df)` |
+| Datasets + GroupKFold | `src/data.py` | `build_group_kfold(df)`, `_fast_jpeg_open` draft mode |
 | NT-Xent loss | `src/loss.py` | `gather_distributed=True` for DDP |
+| ResNet-18 + heads | `src/model.py` | backbone `fc` → Identity, dim 512 |
+| Linear probe + align/uniform | `src/diagnostics.py` | called every `--diagnostic-every` epochs |
+| Reproducibility | `src/seed_utils.py` | `set_seed`, `worker_init_fn`, `make_generator` |
 
 ---
 
 ## Checklist (tick as you go)
 
 - [ ] Day 1: sanity check passes, no fold leakage
-- [ ] Day 2: pretrain to ep200 (or partial ckpt uploaded if timeout)
-- [ ] Day 3: pretrain resume to ep200 (skip if Day 2 finished)
+- [ ] Day 2: pretrain to ep100 (or partial ckpt uploaded if timeout)
+- [ ] Day 3: pretrain resume to ep100 (skip if Day 2 finished)
 - [ ] `simclr-pretrain-final` dataset uploaded
 - [ ] Day 4 PM: 3 conditions trained fold 0, headline recorded
 - [ ] Day 4 Late: 5-fold ensemble of winner, submission CSV generated
