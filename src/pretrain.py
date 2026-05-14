@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -41,7 +42,9 @@ def _unwrap(m: nn.Module) -> nn.Module:
 
 def setup_distributed() -> tuple:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
+        # 60-min timeout: rank0 runs linear probe alone every N epochs while
+        # other ranks idle. Default 10-min NCCL watchdog kills them otherwise.
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -273,7 +276,8 @@ def run_pretrain(args) -> None:
             "t_compute_avg": t_compute_sum / max(n_batches, 1),
         }
 
-        if is_main(rank) and (epoch + 1) % args.diagnostic_every == 0:
+        run_diag = (epoch + 1) % args.diagnostic_every == 0
+        if run_diag and is_main(rank):
             base = _unwrap(model)
             base.eval()
             au = sample_alignment_uniformity(base, loader, device, max_batches=3)
@@ -295,6 +299,12 @@ def run_pretrain(args) -> None:
             if is_main(rank):
                 with open(out_dir / "history.json", "w") as f:
                     json.dump(history, f, indent=2)
+
+        # Sync ranks after rank0-only work (diagnostics + checkpoint save).
+        # Without this, non-rank0 starts next epoch's forward while rank0 still
+        # busy — DDP gradient sync desyncs, NCCL watchdog kills idle ranks.
+        if world_size > 1:
+            dist.barrier()
 
     if world_size > 1:
         dist.destroy_process_group()
