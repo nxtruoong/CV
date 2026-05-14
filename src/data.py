@@ -82,6 +82,10 @@ class MemmapUnlabeledDataset(Dataset):
 
     Eliminates JPEG decode from the hot loop. Slice -> torch tensor HWC uint8
     -> permute to CHW -> hand to v2 transforms (which accept uint8 tensors).
+
+    Memmap is opened LAZILY per worker (in __getitem__) so that
+    DDP spawn pickling does not carry a live mmap handle. Carrying the handle
+    across `mp.spawn` triggers SIGKILL on Kaggle (handle invalid in child).
     """
 
     def __init__(
@@ -96,21 +100,33 @@ class MemmapUnlabeledDataset(Dataset):
             meta = json.load(f)
         self.n = int(meta["n"])
         self.res = int(meta.get("res", cache_res))
-        self.mm = np.memmap(
-            memmap_path, dtype=np.uint8, mode="r",
-            shape=(self.n, self.res, self.res, 3),
-        )
+        self.memmap_path = memmap_path
         self.view_generator = view_generator
+        self._mm = None  # lazy; opened on first __getitem__ in each worker
+
+    def _ensure_mm(self):
+        if self._mm is None:
+            self._mm = np.memmap(
+                self.memmap_path, dtype=np.uint8, mode="r",
+                shape=(self.n, self.res, self.res, 3),
+            )
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int):
-        arr = np.array(self.mm[idx], copy=True)  # decouple worker from mmap
+        self._ensure_mm()
+        arr = np.array(self._mm[idx], copy=True)  # decouple worker from mmap
         t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # CHW uint8
         if self.view_generator is None:
             return t
         return self.view_generator(t)
+
+    def __getstate__(self):
+        # Drop memmap from pickle so DDP spawn / worker fork doesn't carry handle.
+        state = self.__dict__.copy()
+        state["_mm"] = None
+        return state
 
 
 class LabeledImageDataset(Dataset):
@@ -152,7 +168,7 @@ def make_loader(
     num_workers: int = 4,
     drop_last: bool = False,
     sampler=None,
-    prefetch_factor: int = 4,
+    prefetch_factor: int = 2,
 ) -> DataLoader:
     kwargs = dict(
         dataset=dataset,
