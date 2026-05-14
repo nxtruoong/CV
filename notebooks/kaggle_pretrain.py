@@ -6,7 +6,11 @@ Strategy:
 - DDP via torch.multiprocessing.spawn (notebook-friendly alternative to torchrun).
 - 100 epochs total, batch 768, LR sqrt-scaled, rect 160x120 (W x H).
 - torch.compile(max-autotune) + FP16 AMP + channels_last. First epoch slower
-  due to one-time autotune (1-3 min); steady-state ~3-4 min/epoch.
+  due to one-time autotune (1-3 min); steady-state ~3-4 min/epoch with cache.
+- REQUIRED: run `python -m src.pretrain_cache` first to build the uint8
+  memmap (eliminates JPEG decode bottleneck on Kaggle 4 vCPU). pretrain.py
+  auto-detects the cache and switches dataset accordingly.
+- num_workers=2 per rank (4 total) to match Kaggle 4 vCPU — avoid oversubscribe.
 - Target: <10h wallclock single session. No multi-day resume needed.
 - Save every 10. Diagnostic every 10 (linear probe + align/uniform).
 - Resume from previous checkpoint by setting RESUME below (optional).
@@ -45,7 +49,7 @@ def make_args(resume=None):
         epochs=PRETRAIN_EPOCHS,
         batch_size=PRETRAIN_BATCH_SIZE,
         lr=PRETRAIN_LR,
-        num_workers=8,
+        num_workers=2,  # per-rank; 2 ranks * 2 = 4 total = matches Kaggle 4 vCPU
         amp=True,
         no_compile=False,
         save_every=10,

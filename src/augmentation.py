@@ -1,9 +1,14 @@
 """SimCLR pretrain + supervised fine-tune augmentation pipelines.
 
 NEVER add RandomHorizontalFlip — left/right hand is class-defining for State Farm.
+
+Pretrain pipeline uses `torchvision.transforms.v2` with `v2.ToImage()` prefix so
+it accepts BOTH PIL (JPEG fallback path) AND uint8 CHW tensor (memmap cache path).
 """
 from typing import Tuple
+import torch
 import torchvision.transforms as T
+from torchvision.transforms import v2
 from PIL import Image
 
 from .config import (
@@ -12,20 +17,23 @@ from .config import (
 )
 
 
-def build_pretrain_transform() -> T.Compose:
+def build_pretrain_transform() -> v2.Compose:
     """SimCLR augmentation. Tuned for State Farm cabin scenes (not ImageNet).
 
     Pretrain at 160x120 (W x H, 4:3 aspect — matches dashcam source).
     Phase 2 fine-tune upscales back to IMG_SIZE (224) — FixRes trick.
     Blur kernel scaled to ~10% of pretrain resolution (15 px).
+
+    Accepts PIL or uint8 CHW tensor (memmap cache). Output: float32 CHW tensor.
     """
-    return T.Compose([
-        T.RandomResizedCrop((PRETRAIN_IMG_H, PRETRAIN_IMG_W), scale=(0.5, 1.0)),
-        T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-        T.RandomGrayscale(p=0.2),
-        T.RandomApply([T.GaussianBlur(kernel_size=15, sigma=(0.1, 2.0))], p=0.5),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    return v2.Compose([
+        v2.ToImage(),  # no-op for tensors; PIL -> uint8 CHW tensor
+        v2.RandomResizedCrop((PRETRAIN_IMG_H, PRETRAIN_IMG_W), scale=(0.5, 1.0), antialias=True),
+        v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+        v2.RandomGrayscale(p=0.2),
+        v2.RandomApply([v2.GaussianBlur(kernel_size=15, sigma=(0.1, 2.0))], p=0.5),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
 
@@ -83,10 +91,13 @@ def build_tta_transforms() -> list:
 
 
 class ContrastiveViewGenerator:
-    """Apply transform twice to produce a positive pair for SimCLR."""
+    """Apply transform twice to produce a positive pair for SimCLR.
 
-    def __init__(self, transform: T.Compose):
+    Works for both PIL inputs (JPEG path) and uint8 CHW tensors (memmap path).
+    """
+
+    def __init__(self, transform):
         self.transform = transform
 
-    def __call__(self, img: Image.Image) -> Tuple:
+    def __call__(self, img) -> Tuple:
         return self.transform(img), self.transform(img)

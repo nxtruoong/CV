@@ -18,11 +18,13 @@ from .augmentation import build_pretrain_transform, ContrastiveViewGenerator, \
     build_pretrain_eval_transform
 from .config import (
     PRETRAIN_BATCH_SIZE, PRETRAIN_EPOCHS, PRETRAIN_WARMUP_EPOCHS,
-    PRETRAIN_LR, PRETRAIN_WEIGHT_DECAY, get_working_dir,
+    PRETRAIN_LR, PRETRAIN_WEIGHT_DECAY, PRETRAIN_CACHE_PATH,
+    PRETRAIN_CACHE_INDEX, get_working_dir,
 )
 from .data import (
-    UnlabeledImageDataset, LabeledImageDataset, list_train_images,
-    list_test_images, load_driver_table, build_group_kfold, make_loader,
+    UnlabeledImageDataset, MemmapUnlabeledDataset, LabeledImageDataset,
+    list_train_images, list_test_images, load_driver_table,
+    build_group_kfold, make_loader,
 )
 from .diagnostics import linear_probe, sample_alignment_uniformity
 from .loss import NTXentLoss
@@ -102,15 +104,23 @@ def run_pretrain(args) -> None:
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    pretrain_paths = list_train_images()
-    test_paths = list_test_images()
-    all_paths = pretrain_paths + test_paths
-    if is_main(rank):
-        print(f"Pretrain dataset: {len(all_paths)} images "
-              f"({len(pretrain_paths)} train + {len(test_paths)} test)")
-
     view_gen = ContrastiveViewGenerator(build_pretrain_transform())
-    dataset = UnlabeledImageDataset(all_paths, view_gen)
+    use_cache = (Path(PRETRAIN_CACHE_PATH).exists()
+                 and Path(PRETRAIN_CACHE_INDEX).exists())
+    if use_cache:
+        dataset = MemmapUnlabeledDataset(view_generator=view_gen)
+        if is_main(rank):
+            print(f"Pretrain dataset: {len(dataset)} images "
+                  f"(memmap cache @ {PRETRAIN_CACHE_PATH})")
+    else:
+        pretrain_paths = list_train_images()
+        test_paths = list_test_images()
+        all_paths = pretrain_paths + test_paths
+        dataset = UnlabeledImageDataset(all_paths, view_gen)
+        if is_main(rank):
+            print(f"Pretrain dataset: {len(all_paths)} images "
+                  f"({len(pretrain_paths)} train + {len(test_paths)} test) "
+                  f"[JPEG path — slow; run `python -m src.pretrain_cache` first]")
 
     per_gpu_batch = args.batch_size // max(world_size, 1)
     if world_size > 1:

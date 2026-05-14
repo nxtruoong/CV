@@ -123,17 +123,30 @@ Same data input attached. Settings:
 !pip install -q timm
 ```
 
-### 2.3 Launch pretrain
+### 2.3 Build memmap cache (REQUIRED, one-time, ~5-10 min)
+Eliminates per-step JPEG decode → ~3-4x faster epochs on Kaggle 4-CPU env. Without this the loader is the bottleneck (~5 s/it instead of ~1.5 s/it).
+
 ```python
 import sys, os
 sys.path.insert(0, "/kaggle/working/CV")
+os.environ["PYTHONPATH"] = "/kaggle/working/CV"
 os.chdir("/kaggle/working/CV")
+
+from src.pretrain_cache import main as build_cache_main
+sys.argv = ["pretrain_cache"]
+build_cache_main()
+```
+
+Produces `/kaggle/working/pretrain_cache.bin` (~19 GB at res 256) + `pretrain_cache_index.json`. Idempotent — skips if cache valid.
+
+### 2.4 Launch pretrain
+```python
 exec(open("/kaggle/working/CV/notebooks/kaggle_pretrain.py").read())
 ```
 
-`RESUME = None` already set. DDP via `mp.spawn` auto-detects 2 GPUs. The `sys.path.insert` + `os.chdir` cell is required — exec'd script can fail to resolve `src` on Kaggle without it.
+`pretrain.py` auto-detects the cache and switches to `MemmapUnlabeledDataset` (zero JPEG decode in hot loop). `RESUME = None` already set. DDP via `mp.spawn` auto-detects 2 GPUs.
 
-### 2.4 Monitor
+### 2.5 Monitor
 - tqdm shows per-step loss + sampled `pos`, `neg`, `std` diagnostics every 20 steps
 - Every 10 epochs: `align`, `uniform`, `probe_acc`, `probe_ll` printed
 - Checkpoint saved every 10 epochs to `/kaggle/working/simclr/`
@@ -149,7 +162,7 @@ exec(open("/kaggle/working/CV/notebooks/kaggle_pretrain.py").read())
 
 If `probe_acc` < 0.20 at epoch 30 → **STOP**. Aug or temperature broken. Debug.
 
-### 2.5 If session finishes (100 epochs done)
+### 2.6 If session finishes (100 epochs done)
 1. Verify final ckpt:
    ```python
    !ls -la /kaggle/working/simclr/
@@ -159,7 +172,7 @@ If `probe_acc` < 0.20 at epoch 30 → **STOP**. Aug or temperature broken. Debug
 3. Upload as Kaggle Dataset titled `simclr-pretrain-final`
 4. Skip Day 3, jump to Day 4 PM (finetune)
 
-### 2.6 If session times out before ep100 (fallback)
+### 2.7 If session times out before ep100 (fallback)
 1. Note epoch reached (e.g. ep~70)
 2. Download `simclr_resnet18_latest.pth`
 3. Upload as Kaggle Dataset `simclr-ckpt-resume`
@@ -194,7 +207,7 @@ from src.pretrain import run_pretrain, ddp_worker
 
 RESUME = "/kaggle/input/simclr-ckpt-resume/simclr_resnet18_latest.pth"
 args = argparse.Namespace(
-    epochs=100, batch_size=768, lr=1.732e-3, num_workers=8, amp=True,
+    epochs=100, batch_size=768, lr=1.732e-3, num_workers=2, amp=True,
     no_compile=False, save_every=10, diagnostic_every=10, resume=RESUME,
     output_dir="/kaggle/working/simclr",
 )
@@ -337,7 +350,7 @@ Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for
 
 ### Training
 - **DDP world_size=2 → per-GPU batch 384.** Global batch 768 because NT-Xent gathers features across ranks.
-- **num_workers=8 per rank** is the notebook default (16 total). Kaggle has 4 vCPU — that oversubscribes. If you see > 5 s/it consistently, drop to 4/rank or 2/rank.
+- **num_workers=2 per rank** is the notebook default (4 total) — matches Kaggle 4 vCPU. Higher values trigger torch's `check_worker_number_rationality` warning and slow training via context-switch thrash.
 - **Do NOT use gradient accumulation** to fake larger batch — breaks NT-Xent in-batch negatives.
 - **No horizontal flip** in aug — would mix "phone right" with "phone left" classes.
 - **GroupKFold by subject** is non-negotiable. Random split = driver leakage = inflated val acc.
@@ -360,7 +373,8 @@ Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for
 | Finetune entry | `src/finetune.py` | 2-stage (freeze → discriminative LR) |
 | Submission | `src/submit.py` | TTA 5-crop, no flip, clip [1e-15, 1-1e-15] |
 | Augmentation | `src/augmentation.py` | NO horizontal flip |
-| Datasets + GroupKFold | `src/data.py` | `build_group_kfold(df)`, `_fast_jpeg_open` draft mode |
+| Datasets + GroupKFold | `src/data.py` | `build_group_kfold(df)`, `_fast_jpeg_open`, `MemmapUnlabeledDataset` |
+| Pre-decode cache builder | `src/pretrain_cache.py` | run once before pretrain on Kaggle |
 | NT-Xent loss | `src/loss.py` | `gather_distributed=True` for DDP |
 | ResNet-18 + heads | `src/model.py` | backbone `fc` → Identity, dim 512 |
 | Linear probe + align/uniform | `src/diagnostics.py` | called every `--diagnostic-every` epochs |

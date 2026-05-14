@@ -7,6 +7,11 @@ IMG_SIZE = 224
 PRETRAIN_IMG_SIZE = 160  # long-side, used for JPEG draft decode
 PRETRAIN_IMG_H = 120
 PRETRAIN_IMG_W = 160
+# Pre-decoded uint8 memmap cache for pretrain dataloader. Eliminates per-step
+# JPEG decode (~3-4x throughput win on Kaggle 4-CPU env at batch 768).
+PRETRAIN_CACHE_RES = 256  # (N, 256, 256, 3) uint8 ~ 19 GB for 102k images
+PRETRAIN_CACHE_PATH = "/kaggle/working/pretrain_cache.bin"
+PRETRAIN_CACHE_INDEX = "/kaggle/working/pretrain_cache_index.json"
 NUM_CLASSES = 10
 
 CLASS_NAMES = [
